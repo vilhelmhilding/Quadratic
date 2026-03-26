@@ -1,6 +1,8 @@
 # Quadratic – LINC Hackathon 2026 Submission 
 ## Ranked #1 in Performance
 
+![Performance](performance_plot.png)
+
 ## Summary
 
 We developed a multi-strategy systematic trading approach combining statistical arbitrage, cross-sectional momentum, and index mispricing.
