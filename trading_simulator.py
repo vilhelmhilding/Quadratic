@@ -5,7 +5,7 @@ from matplotlib.gridspec import GridSpecFromSubplotSpec
 
 # ===== SIMULATE TRADING AND GENERATE ORDERS =====
 class TradingSimulator:
-    def __init__(self, assets, initial_cash=100_000, equity_currency_map=None, fx_pairs_map=None):
+    def __init__(self, assets, initial_cash=100_000, equity_currency_map=None, fx_pairs_map=None, base_currency='Crncy_01'):
         self.assets = assets
         self.initial_cash = initial_cash
         self.cash = initial_cash
@@ -14,8 +14,9 @@ class TradingSimulator:
         self.portfolio_snapshots = []
         self.equity_currency_map = equity_currency_map or {}
         self.fx_pairs_map = fx_pairs_map or {}
+        self.base_currency = base_currency
 
-    def execute_order(self, date, ticker, action, shares, price):
+    def execute_order(self, date, ticker, action, shares, price, prices_row=None):
         """Execute a buy/sell order and record it.
 
         Shorting:
@@ -24,13 +25,21 @@ class TradingSimulator:
 
         There is no cash requirement for opening a short, but the short
         position contributes negative value to the portfolio.
+
+        Cash, commodities and indices are always held in base_currency. Costs and proceeds for assets
+        denominated in a foreign currency are converted to base_currency using
+        the FX rate at execution time (prices_row).
         """
         action = action.upper()
         if shares <= 0:
             return False
 
+        fx_rates = self._get_fx_rates(prices_row) if prices_row and self.fx_pairs_map else {}
+        ccy = self.equity_currency_map.get(ticker)
+        fx_rate = fx_rates.get(ccy, 1.0) if ccy else 1.0
+
         if action == 'BUY':
-            cost = price * shares
+            cost = price * shares * fx_rate
             if cost > self.cash:
                 return False
             self.cash -= cost
@@ -46,7 +55,7 @@ class TradingSimulator:
             return True
 
         if action == 'SELL':
-            proceeds = price * shares
+            proceeds = price * shares * fx_rate
             self.cash += proceeds
             self.portfolio[ticker] -= shares
             self.orders.append({
@@ -87,34 +96,60 @@ class TradingSimulator:
                 exec_date   = date
 
             for action, ticker, shares in orders:
-                self.execute_order(exec_date, ticker, action, shares, exec_prices[ticker])
+                self.execute_order(exec_date, ticker, action, shares, exec_prices[ticker], exec_prices)
 
             self.record_portfolio(date, signal_prices)
 
-    def execute_trade(self, date, ticker, signal, price, shares=10):
+    def execute_trade(self, date, ticker, signal, price, shares=10, prices_row=None):
         """Convenience wrapper around execute_order using numeric signals.
 
         signal =  1 → BUY
         signal = -1 → SELL (or open/extend short)
         """
         if signal == 1:
-            return self.execute_order(date, ticker, 'BUY', shares, price)
+            return self.execute_order(date, ticker, 'BUY', shares, price, prices_row)
         elif signal == -1:
-            return self.execute_order(date, ticker, 'SELL', shares, price)
+            return self.execute_order(date, ticker, 'SELL', shares, price, prices_row)
         return False
+
+    def _get_fx_rates(self, prices_row):
+        """Return {currency: rate} where rate converts 1 unit of that currency to base_currency.
+
+        FX prices are indexed to 100 at inception. For pair (base_ccy, quote_ccy):
+          - FX price P means 1 base_ccy = P/100 * initial_quote units of quote_ccy
+          - To convert base_ccy → portfolio base: multiply by P/100 (if quote_ccy is base)
+          - To convert quote_ccy → portfolio base: multiply by 100/P (if base_ccy is base)
+        """
+        rates = {self.base_currency: 1.0}
+        for fx_ticker, (base_ccy, quote_ccy) in self.fx_pairs_map.items():
+            fx_price = prices_row.get(fx_ticker, 100.0)
+            if fx_price <= 0:
+                continue
+            if quote_ccy == self.base_currency and base_ccy not in rates:
+                rates[base_ccy] = fx_price / 100.0
+            elif base_ccy == self.base_currency and quote_ccy not in rates:
+                rates[quote_ccy] = 100.0 / fx_price
+        return rates
 
     def record_portfolio(self, date, prices_row):
         """Record portfolio snapshot including FX exposure per currency."""
         snapshot = {'Date': date, 'Cash': self.cash}
+
+        fx_rates = self._get_fx_rates(prices_row) if self.fx_pairs_map else {}
 
         for ticker in self.assets:
             shares = self.portfolio[ticker]
             snapshot[f'{ticker}_Shares'] = shares
             snapshot[f'{ticker}_Value'] = shares * prices_row[ticker]
 
-        total_holdings = sum(
-            self.portfolio[ticker] * prices_row[ticker] for ticker in self.assets
-        )
+        total_holdings = 0.0
+        for ticker in self.assets:
+            local_value = self.portfolio[ticker] * prices_row[ticker]
+            ccy = self.equity_currency_map.get(ticker)
+            if ccy and ccy != self.base_currency and fx_rates:
+                total_holdings += local_value * fx_rates.get(ccy, 1.0)
+            else:
+                total_holdings += local_value
         snapshot['Total_Value'] = self.cash + total_holdings
 
         # Net FX exposure per currency:
@@ -125,8 +160,12 @@ class TradingSimulator:
         if self.equity_currency_map:
             net: dict[str, float] = {}
 
-            # Equity leg
-            for asset, crncy in self.equity_currency_map.items():
+            # Equity leg — all assets; those without a currency mapping are
+            # treated as denominated in base_currency.
+            for asset in self.assets:
+                crncy = self.equity_currency_map.get(asset, self.base_currency)
+                if asset in self.fx_pairs_map:
+                    continue  # FX instruments handled in the hedge leg below
                 val = self.portfolio.get(asset, 0) * prices_row.get(asset, 0)
                 net[crncy] = net.get(crncy, 0.0) + val
 
@@ -138,21 +177,34 @@ class TradingSimulator:
 
             # Hedge score: fraction of FX exposure offset by FX hedges (0-100).
             # 0 = unhedged, 100 = fully hedged, negative = over-hedged.
-            # Baseline is equity-only exposure so stock-only strategies score 0
-            # and commodity/index-only strategies (nothing in equity_currency_map)
-            # score 100 but are flagged as N/A in displays.
             unhedged: dict[str, float] = {}
-            for asset, crncy in self.equity_currency_map.items():
+            for asset in self.assets:
+                crncy = self.equity_currency_map.get(asset, self.base_currency)
+                if asset in self.fx_pairs_map:
+                    continue
                 val = self.portfolio.get(asset, 0) * prices_row.get(asset, 0)
                 unhedged[crncy] = unhedged.get(crncy, 0.0) + val
 
-            rms_unhedged = float(np.sqrt(np.mean([v**2 for v in unhedged.values()]))) if unhedged else 0.0
-            rms_hedged   = float(np.sqrt(np.mean([v**2 for v in net.values()])))      if net      else 0.0
-            hedge_score  = float(max(0.0, 100 * (1 - rms_hedged / max(rms_unhedged, 1.0))))
-
-            snapshot['_fx_exposure']   = net
-            snapshot['_hedge_score']   = hedge_score
-            snapshot['_rms_unhedged']  = rms_unhedged
+            # Convert each currency's exposure to base before taking RMS.
+            # Exclude base currency — it is never hedged (home currency risk)
+            # and including it inflates RMS_hedged via the FX instrument quote leg.
+            foreign_unhedged = {c: v for c, v in unhedged.items() if c != self.base_currency}
+            foreign_net      = {c: v for c, v in net.items()      if c != self.base_currency}
+            rms_unhedged = float(np.sqrt(np.mean(
+                [(v * fx_rates.get(c, 1.0)) ** 2 for c, v in foreign_unhedged.items()]
+            ))) if foreign_unhedged else 0.0
+            rms_hedged = float(np.sqrt(np.mean(
+                [(v * fx_rates.get(c, 1.0)) ** 2 for c, v in foreign_net.items()]
+            ))) if foreign_net else 0.0
+            # Skip hedge score on sign-flip days: when foreign equity exposure is
+            # near zero the ratio rms_hedged/rms_unhedged blows up and produces a
+            # misleading spike. Threshold: 1% of initial_cash.
+            min_exposure = self.initial_cash * 0.01
+            if rms_unhedged >= min_exposure:
+                hedge_score = float(max(0.0, 100 * (1 - rms_hedged / rms_unhedged)))
+                snapshot['_fx_exposure']   = net
+                snapshot['_hedge_score']   = hedge_score
+                snapshot['_rms_unhedged']  = rms_unhedged
 
         self.portfolio_snapshots.append(snapshot)
 
@@ -170,12 +222,12 @@ class TradingSimulator:
 
     def calculate_sharpe_ratio(self):
         portfolio_df = pd.DataFrame(self.portfolio_snapshots)
-        daily_pnl = portfolio_df['Total_Value'].diff().dropna()
+        daily_returns = portfolio_df['Total_Value'].pct_change().dropna()
 
-        if len(daily_pnl) < 2 or daily_pnl.std() == 0:
+        if len(daily_returns) < 2 or daily_returns.std() == 0:
             return 0.0
 
-        return float(np.sqrt(260) * daily_pnl.mean() / daily_pnl.std())
+        return float(np.sqrt(260) * daily_returns.mean() / daily_returns.std())
     
     def calculate_metrics(self):
         """
@@ -184,7 +236,7 @@ class TradingSimulator:
         Returns
         -------
         dict with keys:
-            adjusted_sharpe, sharpe, sharpe_1d_lag, skewness,
+            adjusted_sharpe, sharpe, skewness,
             max_drawdown, nbr_of_trades,
             returns (Series), rolling_sharpe (Series), rolling_std (Series),
             fx_hedge_scores (list)
@@ -197,17 +249,14 @@ class TradingSimulator:
         if len(daily_pnl) < 2 or daily_pnl.std() == 0:
             return {}
 
-        ann    = np.sqrt(260)
-        sharpe = float(ann * daily_pnl.mean() / daily_pnl.std())
-        skew   = float(daily_pnl.skew())
-        kurt   = float(daily_pnl.kurt())   # excess kurtosis
+        ann          = np.sqrt(260)
+        daily_returns = total_val.pct_change().dropna()
+        sharpe = float(ann * daily_returns.mean() / daily_returns.std())
+        skew   = float(daily_returns.skew())
+        kurt   = float(daily_returns.kurt())   # excess kurtosis
 
         # Adjusted Sharpe -- penalty for skew & fat tails
         adj_sharpe = sharpe * (1 + sharpe / 6 * skew - (sharpe ** 2) / 24 * kurt)
-
-        # Sharpe 1d lag -- large gap vs sharpe suggests lookahead bias
-        lagged     = daily_pnl.shift(1).dropna()
-        sharpe_lag = float(ann * lagged.mean() / lagged.std()) if lagged.std() > 0 else 0.0
 
         # Max drawdown
         cum    = daily_pnl.cumsum()
@@ -217,11 +266,11 @@ class TradingSimulator:
         # Rolling metrics (1-year window)
         w = 260
         rolling_sharpe = (
-            daily_pnl.rolling(w, min_periods=w // 2).mean()
-            / daily_pnl.rolling(w, min_periods=w // 2).std()
+            daily_returns.rolling(w, min_periods=w // 2).mean()
+            / daily_returns.rolling(w, min_periods=w // 2).std()
             * ann
         )
-        daily_ret_pct = (total_val.pct_change().dropna() * 100).reindex(daily_pnl.index)
+        daily_ret_pct = (daily_returns * 100).reindex(daily_pnl.index)
         rolling_std = daily_ret_pct.rolling(w, min_periods=w // 2).std()
 
         # FX hedge scores
@@ -239,7 +288,6 @@ class TradingSimulator:
         return dict(
             adjusted_sharpe       = adj_sharpe,
             sharpe                = sharpe,
-            sharpe_1d_lag         = sharpe_lag,
             skewness              = skew,
             max_drawdown          = max_dd,
             nbr_of_trades         = len(self.orders),
@@ -350,11 +398,9 @@ class TradingSimulator:
         fx_series = m.get('fx_hedge_score_series', pd.Series(dtype=float))
         if len(fx_series) > 0:
             ax_fx.plot(fx_series.index, fx_series, color=INDIGO, lw=1.4)
-            ax_fx.axhline(100, color=GREEN, lw=0.8, ls='--', alpha=0.5, label='Perfect (100)')
+            ax_fx.axhline(100, color=GREEN, lw=0.8, ls='--', alpha=0.5)
             ax_fx.set_ylim(0, 105)
-            ax_fx.legend(fontsize=8, framealpha=0.2, facecolor=AX_BG,
-                         edgecolor=GRID, labelcolor=TEXT)
-        style_ax(ax_fx, '', ylabel='FX Hedge', hide_xticks=True)
+        style_ax(ax_fx, '', ylabel='FX Hedge (%)', hide_xticks=True)
 
         # Rolling Volatility
         ax_vol = fig.add_subplot(rolling_gs[2], sharex=ax_rs)
@@ -409,15 +455,16 @@ class TradingSimulator:
             s.get('_rms_unhedged', 0) > 0
             for s in self.portfolio_snapshots
         )
-        WHITE_ROWS = {6, 7}  # FX Hedge Score, # Trades always white
+        mean_vol = float(m.get('rolling_std', pd.Series(dtype=float)).mean())
+        WHITE_ROWS = {5, 6, 7}  # FX Hedge, Volatility, # Trades always white
         rows_data = [
             ["Net P&L",           f'${net_profit:+,.0f}'],
             ["Sharpe",            f'{m.get("sharpe", 0):+.3f}'],
             ["Adj. Sharpe",       f'{m.get("adjusted_sharpe", 0):+.3f}'],
-            ["Sharpe 1d lag",     f'{m.get("sharpe_1d_lag", 0):+.3f}'],
             ["Skewness",          f'{m.get("skewness", 0):+.3f}'],
             ["Max DD",            f'${m.get("max_drawdown", 0):+,.0f}'],
-            ["FX Hedge Score",    f'{fx_score_val:.1f}/100' if (fx_score_val is not None and has_fx_exposure) else 'N/A'],
+            ["FX Hedge",          f'{fx_score_val:.1f}%' if (fx_score_val is not None and has_fx_exposure) else 'N/A'],
+            ["Volatility",        f'{mean_vol:.2f}%' if not np.isnan(mean_vol) else 'N/A'],
             ["# Trades",          f'{m.get("nbr_of_trades", 0):,}'],
         ]
         tbl = ax_tbl.table(cellText=rows_data, loc='upper center',
@@ -461,10 +508,9 @@ class TradingSimulator:
         print(f"  Net P&L           ${net_profit:>+14,.2f}  ({net_pct:+.2f}%)")
         print(f"  Sharpe            {m.get('sharpe', 0):>14.3f}")
         print(f"  Adjusted Sharpe   {m.get('adjusted_sharpe', 0):>14.3f}")
-        print(f"  Sharpe 1d lag     {m.get('sharpe_1d_lag', 0):>14.3f}")
         print(f"  Skewness          {m.get('skewness', 0):>14.3f}")
         if fx_scores:
-            print(f"  FX Hedge Score    {fx_scores[-1]:>13.1f}/100")
+            print(f"  FX Hedge (%)      {fx_scores[-1]:>13.1f}%")
         print(f"  Max Drawdown      ${m.get('max_drawdown', 0):>+14,.2f}")
         print(f"  # Trades          {m.get('nbr_of_trades', 0):>14,}")
         print(f"{'='*w}\n")
