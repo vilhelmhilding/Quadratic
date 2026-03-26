@@ -1,6 +1,5 @@
-# Trading Strategy – Hackathon Submission (Ranked #1 in Performance)
-
-This repository contains our submission for the trading hackathon.
+# Quadratic – LINC Hackathon 2026 Submission 
+## Ranked #1 in Performance
 
 ## Summary
 
@@ -40,7 +39,7 @@ The final portfolio aggregates all three sleeves and applies a **global FX hedge
 
 ## Results
 
-- Total return: ~368%
+- Total return: ~368% over three years
 - Substantially higher than other submissions (typically ~10–50%)
 - Low drawdown relative to return
 - Consistent performance across the full period
