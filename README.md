@@ -42,7 +42,7 @@ The final portfolio aggregates all three sleeves and applies a **global FX hedge
 ## Results
 
 - Total return: ~368% over three years
-- Substantially higher than other submissions (typically ~10–50%)
+- Substantially higher than other submissions (typically ~10–75%)
 - Low drawdown relative to return
 - Consistent performance across the full period
 
